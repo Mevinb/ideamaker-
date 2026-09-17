@@ -47,6 +47,13 @@ test("a chat round pitches openly, debates freely, then votes a winner", async (
     assert.ok(prompts.every(prompt => prompt.includes("Group chat so far")));
     // Votes carry a ballot of the pitches.
     assert.ok(prompts.filter(prompt => prompt.includes("Cast your vote")).every(prompt => prompt.includes("Ballot:")));
+    // The four opening pitches cover four different corners, not one idea four times.
+    const cornerMarks = ["physical or in-person", "visual, generative", "utility, systems", "wild card"];
+    const covered = new Set(prompts.slice(0, 4).map(prompt => cornerMarks.findIndex(mark => prompt.includes(mark))));
+    assert.equal(covered.size, 4);
+    assert.ok(!covered.has(-1));
+    // Debate compares options instead of piling onto one.
+    assert.ok(prompts.some(prompt => prompt.includes("at least two different options")));
     // Later turns can actually react to earlier speakers by name.
     assert.match(prompts[4], /Sam:/);
     // Nobody is hidden from the discussion and nobody has a scripted role.

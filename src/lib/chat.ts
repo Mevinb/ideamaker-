@@ -24,7 +24,16 @@ const IDEA_QUALITY =
   "Prefer numbers, visible consequences, and a real demo moment over adjectives like seamless, immersive, or delightful.";
 
 const DISCUSS_INSTRUCTION =
-  "Jump into the discussion freely. Back the idea you think is strongest and say exactly why, disagree openly with weak points, or combine the best bits of several ideas. You may change your mind. Quote something specific someone said.";
+  "Jump into the discussion freely. Engage with at least two different options — say what each does best and where each falls short — instead of piling onto one. Back the idea you think is strongest and say exactly why, disagree openly with weak points, or combine the best bits of several ideas. You may change your mind. Quote something specific someone said.";
+
+// Opening corners only shape the first pitch so the ballot holds genuinely
+// different directions. They are not roles: everything after is free debate.
+const PITCH_CORNERS = [
+  "physical or in-person interaction — something people do with their bodies, voices, or each other in a shared space",
+  "visual, generative, or sensory experience — something striking to see, hear, or play with",
+  "utility, systems, or data transformation — something that takes a messy input and turns it into useful output",
+  "wild card — the strangest direction that is still buildable overnight, unlike anything the other corners would produce",
+];
 
 function presetDirection(preset: Run["preset"]): string {
   return {
@@ -43,8 +52,8 @@ function speakerName(message: ChatMessage): string {
   return "Participant";
 }
 
-function shuffled(seats: number[]): number[] {
-  const order = [...seats];
+function shuffled<T>(items: T[]): T[] {
+  const order = [...items];
   for (let i = order.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [order[i], order[j]] = [order[j], order[i]];
@@ -388,9 +397,11 @@ export async function runChatRound(runId: string): Promise<void> {
 
       if (round === 1) {
         const historyExclusions = exhaustedTerritories(runId);
-        // Everyone pitches — same open brief for all, no roles.
+        // Everyone pitches from a different corner so the ballot holds four
+        // genuinely different directions instead of four riffs on one idea.
+        const corners = shuffled([...PITCH_CORNERS]);
         for (const participant of SEATS) {
-          await speak(participant, `Pitch YOUR idea for the brief: give it a name, say what the user actually does, and what they see happen. Make it different from any idea already pitched in this chat. Stay specific and buildable. ${historyExclusions}`);
+          await speak(participant, `Your corner for this pitch: ${corners[participant]}. Pitch ONE concrete idea from your corner: give it a name, say what the user actually does, and what they see happen. It must be a genuinely different direction from any idea already pitched in this chat — a different core action and mechanism, not a variation. Stay specific and buildable. ${historyExclusions}`);
         }
         updateRun(runId, { stage: `Round ${round} · reacting` });
         // Open debate, shuffled so anyone can jump in after anyone.
@@ -405,8 +416,9 @@ export async function runChatRound(runId: string): Promise<void> {
           // Deadlock: nobody agreed, so everyone finds something new.
           messageEvent(runId, { role: "system", content: "Nobody agreed, so everyone is pitching a fresh idea.", round });
           const freshMarker = getEvents(runId).at(-1)?.id ?? 0;
+          const freshCorners = shuffled([...PITCH_CORNERS]);
           for (const participant of SEATS) {
-            await speak(participant, "The group couldn't agree. Pitch ONE brand-new idea: a different core action and mechanism from everything pitched so far in this chat. Name it, say what the user does and sees.");
+            await speak(participant, `The group couldn't agree. Pitch ONE brand-new idea from your corner (${freshCorners[participant]}): a different core action and mechanism from everything pitched so far in this chat. Name it, say what the user does and sees.`);
           }
           updateRun(runId, { stage: `Round ${round} · reacting` });
           for (const participant of shuffled(SEATS)) await speak(participant, DISCUSS_INSTRUCTION);
