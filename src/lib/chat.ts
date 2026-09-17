@@ -76,22 +76,40 @@ function transcript(run: Run): string {
   return output;
 }
 
-/** Compact first-round ideas from other chats give new sessions a useful novelty boundary. */
-function recentIdeaExclusions(runId: string): string {
-  const excerpts: string[] = [];
+const TERRITORY_STOPWORDS = new Set(
+  "a,an,the,and,or,of,to,in,on,with,for,from,that,this,these,those,it,its,is,are,was,were,be,been,by,as,at,into,through,via,using,use,used,user,users,app,apps,experience,new,novel,idea,ideas,concept,concepts,system,platform,project,projects,build,builds,built,make,makes,help,helps,like,just,more,most,than,then,their,they,them,when,where,which,while,who,will,your,you,we,our,can,should,could,would,one,two,also,well,even,every,without,within,across,another,other,codex,gpt,ai,pitch,demo,hackathon,team,hours,hour,time".split(",")
+);
+
+/**
+ * Novelty boundary mined from prior chats. Deliberately abstract: pasting full
+ * prior pitches into the prompt anchors the model to the same space even under
+ * negation ("avoid these" reads as examples to imitate). Repeated two-word
+ * territories ("pull request", "code review") name the rut without feeding it.
+ */
+export function exhaustedTerritories(runId: string): string {
+  const texts: string[] = [];
   for (const previous of listRuns()) {
     if (previous.id === runId || previous.mode !== "chat") continue;
     const openings = getEvents(previous.id).map(parseMessage)
       .filter((message): message is ChatMessage => Boolean(message && message.role === "assistant" && message.round === 1))
       .slice(0, 3);
-    for (const opening of openings) {
-      const compact = opening.content.replace(/\s+/g, " ").trim();
-      if (compact) excerpts.push(compact.slice(0, 240));
-    }
-    if (excerpts.length >= RECENT_RUNS_FOR_NOVELTY * 3) break;
+    for (const opening of openings) texts.push(opening.content.toLowerCase());
+    if (texts.length >= RECENT_RUNS_FOR_NOVELTY * 3) break;
   }
-  if (!excerpts.length) return "No prior opening ideas are saved yet.";
-  return `Avoid repeating these prior opening ideas, including renamed versions with the same user experience or mechanism:\n${excerpts.map((item, index) => `${index + 1}. ${item}`).join("\n")}`;
+  const docFreq = new Map<string, number>();
+  for (const text of texts) {
+    const tokens = text.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(token => token.length > 2 && !TERRITORY_STOPWORDS.has(token));
+    const seen = new Set<string>();
+    for (let i = 0; i + 1 < tokens.length; i++) seen.add(`${tokens[i]} ${tokens[i + 1]}`);
+    for (const bigram of seen) docFreq.set(bigram, (docFreq.get(bigram) ?? 0) + 1);
+  }
+  const top = [...docFreq.entries()]
+    .filter(([, count]) => texts.length >= 3 && count >= 3)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([bigram, count]) => `- "${bigram}" (in ${count} prior runs)`);
+  if (!top.length) return "No prior opening ideas are saved yet — start fresh.";
+  return `These territories are exhausted in prior runs. Do not pitch there, and do not just rename them:\n${top.join("\n")}\nVary the WHO and WHERE: if prior runs served developers at a desk, serve someone else somewhere else. No developer-tool or repo-centered idea unless the brief explicitly asks for one.`;
 }
 
 const FAILED_MODELS = new Set<string>();
@@ -331,7 +349,7 @@ export async function runChatRound(runId: string): Promise<void> {
       };
 
       if (round === 1) {
-        const historyExclusions = recentIdeaExclusions(runId);
+        const historyExclusions = exhaustedTerritories(runId);
         await speak(0, `Open the chat. React to the brief like a friend with a fresh take and pitch ONE concrete idea in your own words: give it a name, say what the user actually does, and what they see happen. Stay specific and buildable. ${historyExclusions}`);
         await speak(1, "Explorer just opened. Reply to Explorer by name: say what feels weak, risky, or generic, then offer one sharper twist that keeps what works. Be honest, not rude.");
         await speak(2, "Reply to Explorer and Challenger by name. Pick the strongest thread so far and say how you would actually build the first working version: concrete pieces, what to cut, and what it does on day one.");
