@@ -4,26 +4,27 @@ import { availableModels, omniChat } from "./omniroute";
 import type { ChatMessage, Run, RunEvent } from "./types";
 
 const MAX_CONTEXT = 50_000;
-// Total model-call budget per runChatRound invocation. Sized so each of the six
-// speakers can fail over to several alternates without starving later speakers.
-const MAX_REQUESTS = 24;
+// Total model-call budget per round. Sized for the busiest path: 4 pitches +
+// 8 debate turns + 4 votes, plus one deadlock cycle of 4 fresh pitches +
+// 4 debate turns + 4 votes.
+const MAX_REQUESTS = 30;
 const MAX_AUTONOMOUS_ROUNDS = 2;
 const RECENT_RUNS_FOR_NOVELTY = 20;
 // Alternates tried per speaker before that speaker sits out (the round continues).
 const MAX_SPEAKER_ATTEMPTS = 6;
 
-export const PARTICIPANT_ROLES = ["Explorer", "Challenger", "Builder", "Connector"];
-const PARTICIPANTS = [
-  "A creative product visionary who loves specific, visual, memorable ideas. You pitch one concrete direction at a time and react warmly when others improve it.",
-  "A sharp, pragmatic critic. You like bold ideas but call out vague, generic, or fragile parts by name and offer one sharper twist.",
-  "A practical full-stack builder. You turn the strongest thread into something that can actually be built fast, naming concrete pieces and cuts.",
-  "A connector who listens to everyone. You notice which bits fit together, name the direction worth keeping, and ask the one question that unblocks the next step.",
-];
+// Stable seats so each voice keeps its model. These are just names — nobody has
+// a role, nobody leads, and anyone can pitch, argue, or change their mind.
+export const PARTICIPANT_NAMES = ["Sam", "Alex", "Robin", "Kai"];
+const SEATS = [0, 1, 2, 3];
 
 const IDEA_QUALITY =
   "Good ideas are concrete: name what the user does, what they see happen, and how it works in one input -> change -> payoff loop. " +
   "Avoid generic chatbots, mood journals, habit trackers, dashboards, marketplaces, or playlist generators unless the interaction itself is genuinely new. " +
   "Prefer numbers, visible consequences, and a real demo moment over adjectives like seamless, immersive, or delightful.";
+
+const DISCUSS_INSTRUCTION =
+  "Jump into the discussion freely. Back the idea you think is strongest and say exactly why, disagree openly with weak points, or combine the best bits of several ideas. You may change your mind. Quote something specific someone said.";
 
 function presetDirection(preset: Run["preset"]): string {
   return {
@@ -38,8 +39,17 @@ function presetDirection(preset: Run["preset"]): string {
 function speakerName(message: ChatMessage): string {
   if (message.role === "user") return "User";
   if (message.agent) return message.agent;
-  if (message.participant !== undefined) return PARTICIPANT_ROLES[message.participant] || `Participant ${message.participant + 1}`;
+  if (message.participant !== undefined) return PARTICIPANT_NAMES[message.participant] || `Participant ${message.participant + 1}`;
   return "Participant";
+}
+
+function shuffled(seats: number[]): number[] {
+  const order = [...seats];
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  return order;
 }
 
 function active(runId: string): void {
@@ -203,9 +213,8 @@ async function reply(
 ): Promise<{ attempts: number; model: string }> {
   active(run.id);
   const requested = modelToUse || run.settings.models.generators[participant] || "auto";
-  const name = PARTICIPANT_ROLES[participant];
-  const others = PARTICIPANT_ROLES.filter((_, index) => index !== participant).join(", ");
-  const system = `You are ${name} in a small group chat with ${others}, brainstorming together. ${PARTICIPANTS[participant]} Talk like a real person in a group thread: use plain prose with no bullet points, headings, or reports, reply to specific people by name, quote a concrete detail they said, and add one thought per message. Keep it short: 2-5 sentences, under 450 characters. Never summarize the whole chat or deliver a verdict. ${presetDirection(run.preset)} ${IDEA_QUALITY}`;
+  const name = PARTICIPANT_NAMES[participant];
+  const system = `You are ${name}, one of four friends — ${PARTICIPANT_NAMES.join(", ")} — kicking around ideas in a group chat. Nobody has a role and nobody leads: pitch when you have something, back ideas you like, disagree openly, change your mind. Talk like a real person in plain prose with no bullet points, headings, or reports: 2-5 sentences, under 450 characters, one thought per message. Reply to people by name and quote concrete details they mentioned. Never summarize the chat or deliver a verdict. ${presetDirection(run.preset)} ${IDEA_QUALITY}`;
   const user = `User's brief: ${run.prompt}\n\nGroup chat so far:\n${transcript(run)}\n\nYour turn, ${name}: ${instruction}`;
 
   // Fallback must not depend on the live catalog alone: when the gateway is
@@ -312,7 +321,7 @@ export async function runChatRound(runId: string): Promise<void> {
       const isUserGuiding = round > 1 && latestUserDirection && !latestUserDirection.toLowerCase().includes("continue");
 
       updateRun(runId, { status: "running", stage: `Round ${round} · chatting` });
-      appendEvent(runId, "progress", `Round ${round} started. Explorer, Challenger, Builder, and Connector are talking it through.`, `Round ${round}`);
+      appendEvent(runId, "progress", `Round ${round} started. ${PARTICIPANT_NAMES.join(", ")} are talking it through.`, `Round ${round}`);
 
       const currentRoundUsedModels = new Set<string>();
       const allChatUsedModels = new Set(messages.filter(m => m.model).map(m => m.model!));
@@ -322,7 +331,7 @@ export async function runChatRound(runId: string): Promise<void> {
       const skipped: string[] = [];
       let lastSpeakError: unknown;
       const speak = async (participant: number, instruction: string) => {
-        const label = PARTICIPANT_ROLES[participant];
+        const label = PARTICIPANT_NAMES[participant];
         active(runId);
         const currentRun = getRun(runId)!;
         const modelToUse = await getRoundModel(currentRun, participant, currentRoundUsedModels, allChatUsedModels);
@@ -348,34 +357,84 @@ export async function runChatRound(runId: string): Promise<void> {
         }
       };
 
+      const assistantSince = (eventId: number): ChatMessage[] =>
+        getEvents(runId).filter(e => e.id > eventId).map(parseMessage)
+          .filter((m): m is ChatMessage => Boolean(m && m.role === "assistant"));
+
+      let voteMarker = 0;
+      /** Everyone votes for the strongest option; returns its 1-based number, or -1. */
+      const vote = async (options: ChatMessage[]): Promise<number> => {
+        if (options.length < 2) return -1;
+        const ballot = options.map((option, index) => `${index + 1}. ${cleanCut(option.content, 150)}`).join("\n");
+        for (const participant of SEATS) {
+          await speak(participant, `Cast your vote: which option is strongest? Reply with ONLY one line starting with the option number, a dash, and your short reason (for example "2 — the demo moment is unbeatable").\nBallot:\n${ballot}`);
+        }
+        const tally = new Map<number, number>();
+        for (const ballotVote of assistantSince(voteMarker).slice(-SEATS.length)) {
+          const match = /^\s*(\d+)\s*[—\-:]/.exec(ballotVote.content);
+          const pick = match ? parseInt(match[1], 10) : NaN;
+          if (pick >= 1 && pick <= options.length) tally.set(pick, (tally.get(pick) ?? 0) + 1);
+        }
+        let top = -1;
+        let topCount = 0;
+        let cast = 0;
+        for (const [pick, count] of tally) {
+          cast += count;
+          if (count > topCount) { top = pick; topCount = count; }
+        }
+        if (cast >= 2 && topCount > cast / 2) return top;
+        return -1;
+      };
+
       if (round === 1) {
         const historyExclusions = exhaustedTerritories(runId);
-        await speak(0, `Open the chat. React to the brief like a friend with a fresh take and pitch ONE concrete idea in your own words: give it a name, say what the user actually does, and what they see happen. Stay specific and buildable. ${historyExclusions}`);
-        await speak(1, "Explorer just opened. Reply to Explorer by name: say what feels weak, risky, or generic, then offer one sharper twist that keeps what works. Be honest, not rude.");
-        await speak(2, "Reply to Explorer and Challenger by name. Pick the strongest thread so far and say how you would actually build the first working version: concrete pieces, what to cut, and what it does on day one.");
+        // Everyone pitches — same open brief for all, no roles.
+        for (const participant of SEATS) {
+          await speak(participant, `Pitch YOUR idea for the brief: give it a name, say what the user actually does, and what they see happen. Make it different from any idea already pitched in this chat. Stay specific and buildable. ${historyExclusions}`);
+        }
         updateRun(runId, { stage: `Round ${round} · reacting` });
-        await speak(3, "Reply to everyone by name. Say which bits fit together, name the direction you would keep exploring, and end with one sharp question for the group or user.");
-        updateRun(runId, { stage: `Round ${round} · building` });
-        await speak(0, "The group pushed back. Reply to them by name, keep your idea, and fix its weakest part with one concrete change. Say what you changed and why.");
-        await speak(3, "Close this round like a person, not a report. Say which idea you would carry forward and why in a sentence or two, plus what you want from the user next. Do not list options or declare a winner.");
-      } else if (isUserGuiding) {
-        await speak(0, `The user just said: "${latestUserDirection}". Reply to them directly, stay with their direction unless it is weak, and move the idea forward with one concrete suggestion grounded in the chat so far.`);
-        await speak(1, `The user said: "${latestUserDirection}". Reply to the group by name: what is still risky or vague, and what is one sharper fix?`);
-        await speak(2, `The user said: "${latestUserDirection}". Reply by name: what would you build next, concretely, and what would you cut to keep it working?`);
-        updateRun(runId, { stage: `Round ${round} · reacting` });
-        await speak(3, `React to everyone by name, pull the thread together, and ask the one question that would unblock the next step for: "${latestUserDirection}".`);
-        updateRun(runId, { stage: `Round ${round} · building` });
-        await speak(0, "Give one concrete next step the group could try first, in plain words. Reference what others said.");
-        await speak(3, "Wrap naturally: say what stuck from this round and what to try next. No report, no list, no winner.");
+        // Open debate, shuffled so anyone can jump in after anyone.
+        for (let lap = 0; lap < 2; lap++) {
+          for (const participant of shuffled(SEATS)) await speak(participant, DISCUSS_INSTRUCTION);
+        }
+        // Which idea is best, and why? Majority settles it.
+        let pitches = assistantSince(0).filter(m => m.round === round).slice(0, 4);
+        voteMarker = getEvents(runId).at(-1)?.id ?? 0;
+        let winner = await vote(pitches);
+        if (winner < 0) {
+          // Deadlock: nobody agreed, so everyone finds something new.
+          messageEvent(runId, { role: "system", content: "Nobody agreed, so everyone is pitching a fresh idea.", round });
+          const freshMarker = getEvents(runId).at(-1)?.id ?? 0;
+          for (const participant of SEATS) {
+            await speak(participant, "The group couldn't agree. Pitch ONE brand-new idea: a different core action and mechanism from everything pitched so far in this chat. Name it, say what the user does and sees.");
+          }
+          updateRun(runId, { stage: `Round ${round} · reacting` });
+          for (const participant of shuffled(SEATS)) await speak(participant, DISCUSS_INSTRUCTION);
+          pitches = assistantSince(freshMarker).slice(0, 4);
+          voteMarker = getEvents(runId).at(-1)?.id ?? 0;
+          winner = await vote(pitches);
+          if (winner < 0) {
+            messageEvent(runId, { role: "system", content: "The group is split — over to you to break the tie.", round });
+          } else {
+            messageEvent(runId, { role: "system", content: `The group settled on option ${winner} after a second round of ideas: ${cleanCut(pitches[winner - 1].content, 140)}`, round });
+          }
+        } else {
+          messageEvent(runId, { role: "system", content: `The group settled on option ${winner}: ${cleanCut(pitches[winner - 1].content, 140)}`, round });
+        }
       } else {
-        await speak(0, "No new user direction. Pick up the most promising thread from the chat so far, do not restart, and push it one step forward with a concrete detail.");
-        await speak(1, "Reply by name to what was just said. Challenge the weakest assumption and offer one sharper alternative.");
-        await speak(2, "Reply by name. Ground the current direction: what gets built next, what gets cut, and what working looks like.");
+        // Later rounds: everyone reacts to the user, then open debate.
+        const topic = isUserGuiding
+          ? `React to the user's latest message ("${latestUserDirection}") directly and honestly. Move the strongest thread forward with one concrete thought, or push back with a better angle. Build on what others already said.`
+          : "No new direction from the user. Pick up the most promising thread from the chat so far and push it forward with one concrete thought, or challenge it with a better angle.";
+        for (const participant of shuffled(SEATS)) await speak(participant, topic);
         updateRun(runId, { stage: `Round ${round} · reacting` });
-        await speak(3, "Reply by name, connect the best bits, and ask the group one useful question that keeps the conversation moving.");
-        updateRun(runId, { stage: `Round ${round} · building` });
-        await speak((round - 1) % 3, "Add one vivid, concrete detail: what the user sees, hears, or does in the key moment. Keep it short and human.");
-        await speak(3, "Close the round like a person. Say what you would keep and what you need from the user next. No report or winner.");
+        for (let lap = 0; lap < 2; lap++) {
+          const order = shuffled(SEATS);
+          for (let k = 0; k < order.length; k++) {
+            const wrap = lap === 1 && k === order.length - 1;
+            await speak(order[k], DISCUSS_INSTRUCTION + (wrap ? " If the thread feels settled, say what seems agreed and what the user should do next." : ""));
+          }
+        }
       }
 
       // Only fail honestly when nothing got through; partial rounds still count.

@@ -6,7 +6,9 @@ import { test } from "node:test";
 
 process.env.IDEAARENA_DATA_DIR = mkdtempSync(join(tmpdir(), "ideaarena-chat-tests-"));
 
-test("a chat round feels like one shared group thread with six bounded replies", async () => {
+const NAMES = ["Sam", "Alex", "Robin", "Kai"];
+
+test("a chat round pitches openly, debates freely, then votes a winner", async () => {
   const { createRun, getEvents, getRun } = await import("../src/lib/db");
   const { addUserMessage, runChatRound } = await import("../src/lib/chat");
   const { DEFAULT_SETTINGS } = await import("../src/lib/types");
@@ -23,7 +25,8 @@ test("a chat round feels like one shared group thread with six bounded replies",
     systems.push(body.messages[0].content);
     prompts.push(body.messages[1].content);
     replies++;
-    return Response.json({ model: "fixture", choices: [{ message: { content: `Concise reply ${replies}.` } }] });
+    const content = body.messages[1].content.includes("Cast your vote") ? "1 — strongest hook." : `Concise reply ${replies}.`;
+    return Response.json({ model: "fixture", choices: [{ message: { content } }] });
   };
   try {
     createRun("chat-round", "A tiny camera game for a school event", "hackathon", DEFAULT_SETTINGS, "chat");
@@ -32,25 +35,71 @@ test("a chat round feels like one shared group thread with six bounded replies",
     const run = getRun("chat-round")!;
     assert.equal(run.status, "completed", run.error);
     const messages = getEvents("chat-round").filter(event => event.kind === "message").map(event => JSON.parse(event.message));
-    assert.equal(replies, 6);
-    assert.equal(messages.length, 7);
+    // 4 pitches + 8 debate turns + 4 votes.
+    assert.equal(replies, 16);
     const assistant = messages.filter(message => message.role === "assistant");
-    assert.equal(assistant.length, 6);
+    assert.equal(assistant.length, 16);
     assert.ok(assistant.every(message => message.content.length < 600));
-    assert.deepEqual(assistant.map(message => message.agent), ["Explorer", "Challenger", "Builder", "Connector", "Explorer", "Connector"]);
-    assert.deepEqual(assistant.map(message => message.participant), [0, 1, 2, 3, 0, 3]);
+    // No roles: every seat speaks four times across pitches, debate, and votes.
+    assert.deepEqual(assistant.map(message => message.agent).sort(), [...NAMES, ...NAMES, ...NAMES, ...NAMES].sort());
+    for (const message of assistant) assert.equal(NAMES[message.participant], message.agent);
     // Every turn sees the same shared thread, including the opening turn.
     assert.ok(prompts.every(prompt => prompt.includes("Group chat so far")));
+    // Votes carry a ballot of the pitches.
+    assert.ok(prompts.filter(prompt => prompt.includes("Cast your vote")).every(prompt => prompt.includes("Ballot:")));
     // Later turns can actually react to earlier speakers by name.
-    assert.match(prompts[1], /Explorer:/);
-    assert.match(prompts[2], /Explorer:/);
-    assert.match(prompts[3], /Builder:/);
-    // No isolated-pitch pipeline: nobody is hidden from the discussion.
-    assert.ok(prompts.every(prompt => !prompt.includes("Do not assume another participant")));
+    assert.match(prompts[4], /Sam:/);
+    // Nobody is hidden from the discussion and nobody has a scripted role.
+    assert.ok(systems.every(system => /Nobody has a role/.test(system)));
     assert.ok(systems.every(system => /Talk like a real person/.test(system)));
-    assert.ok(systems.every(system => /no bullet points/.test(system)));
     assert.ok(prompts.every(prompt => !prompt.includes("Concept Alpha")));
-    assert.ok(prompts.every(prompt => !prompt.includes("exploration map")));
+    for (const role of ["Explorer", "Challenger", "Builder", "Connector"]) {
+      assert.ok(prompts.every(prompt => !prompt.includes(role)), role);
+    }
+    // Consensus is announced, not reported.
+    const updates = messages.filter(message => message.role === "system").map(message => message.content);
+    assert.ok(updates.some(content => /settled on option 1/.test(content)));
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("a split vote triggers fresh ideas and a second vote", async () => {
+  const { createRun, getEvents, getRun } = await import("../src/lib/db");
+  const { addUserMessage, runChatRound } = await import("../src/lib/chat");
+  const { DEFAULT_SETTINGS } = await import("../src/lib/types");
+  const realFetch = globalThis.fetch;
+  const prompts: string[] = [];
+  let votes = 0;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).endsWith("/models")) return Response.json({ data: [] });
+    const body = JSON.parse(String(init?.body));
+    prompts.push(body.messages[1].content);
+    if (body.messages[1].content.includes("Cast your vote")) {
+      votes++;
+      // First ballot splits 1-2-3-4; the revote converges on option 2.
+      return Response.json({ model: "fixture", choices: [{ message: { content: `${votes <= 4 ? votes : 2} — my pick.` } }] });
+    }
+    return Response.json({ model: "fixture", choices: [{ message: { content: "Debate point." } }] });
+  };
+  try {
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      models: {
+        ...DEFAULT_SETTINGS.models,
+        generators: ["deadlock-test/model-a", "deadlock-test/model-b", "deadlock-test/model-c", "deadlock-test/model-d"],
+      },
+    };
+    createRun("chat-deadlock", "A tiny camera game for a school event", "hackathon", settings, "chat");
+    addUserMessage("chat-deadlock", "A tiny camera game for a school event");
+    await runChatRound("chat-deadlock");
+    const run = getRun("chat-deadlock")!;
+    assert.equal(run.status, "completed", run.error);
+    const messages = getEvents("chat-deadlock").filter(e => e.kind === "message").map(e => JSON.parse(e.message));
+    // 16 first-cycle turns + 4 fresh pitches + 4 debate turns + 4 revotes.
+    assert.equal(messages.filter(m => m.role === "assistant").length, 28);
+    assert.ok(prompts.some(prompt => prompt.includes("brand-new idea")));
+    const updates = messages.filter(m => m.role === "system").map(m => m.content);
+    assert.ok(updates.some(content => /pitching a fresh idea/.test(content)));
+    assert.ok(updates.some(content => /settled on option 2/.test(content)));
   } finally { globalThis.fetch = realFetch; }
 });
 
@@ -73,7 +122,8 @@ test("chat rounds select distinct models for participants when catalog is availa
     }
     const body = JSON.parse(String(init?.body));
     modelsUsed.push(body.model);
-    return Response.json({ model: body.model, choices: [{ message: { content: "Distinct model idea." } }] });
+    const content = body.messages[1].content.includes("Cast your vote") ? "1 — distinct and best." : "Distinct model idea.";
+    return Response.json({ model: body.model, choices: [{ message: { content } }] });
   };
   try {
     const settings = {
@@ -90,8 +140,8 @@ test("chat rounds select distinct models for participants when catalog is availa
     assert.equal(run.status, "completed", run.error);
     const messages = getEvents("chat-distinct").filter(e => e.kind === "message").map(e => JSON.parse(e.message));
     const assistantMessages = messages.filter(m => m.role === "assistant");
-    assert.equal(assistantMessages.length, 6);
-    // The first 4 participants must all have distinct models
+    assert.equal(assistantMessages.length, 16);
+    // The opening pitches must all have distinct models
     const participantModels = assistantMessages.slice(0, 4).map(m => m.model);
     assert.equal(new Set(participantModels).size, 4);
   } finally { globalThis.fetch = realFetch; }
@@ -103,13 +153,15 @@ test("continuous chat mode loops through rounds and halts on cancellation", asyn
   const { DEFAULT_SETTINGS } = await import("../src/lib/types");
   const realFetch = globalThis.fetch;
   let callCount = 0;
-  globalThis.fetch = async (url) => {
+  globalThis.fetch = async (url, init) => {
     if (String(url).endsWith("/models")) return Response.json({ data: [] });
     callCount++;
     if (callCount === 8) {
       updateRun("chat-continuous", { status: "cancelled" });
     }
-    return Response.json({ model: "fixture", choices: [{ message: { content: `Continuous turn ${callCount}.` } }] });
+    const body = JSON.parse(String(init?.body));
+    const content = body.messages[1].content.includes("Cast your vote") ? "1 — moving on." : `Continuous turn ${callCount}.`;
+    return Response.json({ model: "fixture", choices: [{ message: { content } }] });
   };
   try {
     createRun("chat-continuous", "A multi-agent game", "hackathon", { ...DEFAULT_SETTINGS, continuous: true }, "chat");
@@ -118,8 +170,8 @@ test("continuous chat mode loops through rounds and halts on cancellation", asyn
     const run = getRun("chat-continuous")!;
     assert.equal(run.status, "cancelled");
     assert.ok(callCount >= 8);
-    const events = getEvents("chat-continuous");
-    assert.ok(events.some(e => e.stage?.includes("Round 1 complete")));
+    const messages = getEvents("chat-continuous").filter(e => e.kind === "message").map(e => JSON.parse(e.message));
+    assert.ok(messages.some(m => m.role === "assistant"));
   } finally { globalThis.fetch = realFetch; }
 });
 
@@ -135,7 +187,8 @@ test("a speaker whose model 503s switches models instead of stopping the chat", 
     const body = JSON.parse(String(init?.body));
     prompts.push(body.messages[1].content);
     if (body.model === "failover-test/model-a") return new Response("worker limit reached", { status: 503 });
-    return Response.json({ model: body.model, choices: [{ message: { content: `Reply via ${body.model}.` } }] });
+    const content = body.messages[1].content.includes("Cast your vote") ? "2 — best demo." : `Reply via ${body.model}.`;
+    return Response.json({ model: body.model, choices: [{ message: { content } }] });
   };
   try {
     const settings = {
@@ -151,7 +204,7 @@ test("a speaker whose model 503s switches models instead of stopping the chat", 
     const run = getRun("chat-failover")!;
     assert.equal(run.status, "completed", run.error);
     const messages = getEvents("chat-failover").filter(e => e.kind === "message").map(e => JSON.parse(e.message));
-    assert.equal(messages.filter(m => m.role === "assistant").length, 6);
+    assert.equal(messages.filter(m => m.role === "assistant").length, 16);
     assert.ok(prompts.every(prompt => prompt.includes("Group chat so far")));
     const warnings = getEvents("chat-failover").filter(e => e.kind === "warning").map(e => e.message);
     assert.ok(warnings.some(w => w.includes("live model list was unreachable")));
@@ -170,7 +223,8 @@ test("a model reporting a quota limit is parked with a clear warning while the c
     if (body.model === "quota-test/model-a") {
       return new Response('{"error":{"message":"429 insufficient_quota: daily allowance exhausted"}}', { status: 429 });
     }
-    return Response.json({ model: body.model, choices: [{ message: { content: `Reply via ${body.model}.` } }] });
+    const content = body.messages[1].content.includes("Cast your vote") ? "2 — best demo." : `Reply via ${body.model}.`;
+    return Response.json({ model: body.model, choices: [{ message: { content } }] });
   };
   try {
     const settings = {
@@ -186,7 +240,7 @@ test("a model reporting a quota limit is parked with a clear warning while the c
     const run = getRun("chat-quota")!;
     assert.equal(run.status, "completed", run.error);
     const messages = getEvents("chat-quota").filter(e => e.kind === "message").map(e => JSON.parse(e.message));
-    assert.equal(messages.filter(m => m.role === "assistant").length, 6);
+    assert.equal(messages.filter(m => m.role === "assistant").length, 16);
     const warnings = getEvents("chat-quota").filter(e => e.kind === "warning").map(e => e.message);
     assert.ok(warnings.some(w => /quota or rate limit/.test(w) && w.includes("quota-test/model-a") && w.includes("won't be retried")));
   } finally { globalThis.fetch = realFetch; }
@@ -224,7 +278,8 @@ test("keep talking after a failure retries with other models instead of stopping
     if (String(url).endsWith("/models")) return Response.json({ data: [] });
     if (outage) return new Response("worker limit reached", { status: 503 });
     const body = JSON.parse(String(init?.body));
-    return Response.json({ model: body.model, choices: [{ message: { content: `Recovered via ${body.model}.` } }] });
+    const content = body.messages[1].content.includes("Cast your vote") ? "1 — recovered pick." : `Recovered via ${body.model}.`;
+    return Response.json({ model: body.model, choices: [{ message: { content } }] });
   };
   try {
     const settings = {
@@ -246,6 +301,6 @@ test("keep talking after a failure retries with other models instead of stopping
     assert.ok(!run.error);
     const messages = getEvents("chat-retry").filter(e => e.kind === "message").map(e => JSON.parse(e.message));
     // The failed round never completed, so the retry re-runs round 1.
-    assert.equal(messages.filter(m => m.role === "assistant").length, 6);
+    assert.equal(messages.filter(m => m.role === "assistant").length, 16);
   } finally { globalThis.fetch = realFetch; }
 });
