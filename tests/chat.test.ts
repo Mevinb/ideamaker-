@@ -159,6 +159,39 @@ test("a speaker whose model 503s switches models instead of stopping the chat", 
   } finally { globalThis.fetch = realFetch; }
 });
 
+test("a model reporting a quota limit is parked with a clear warning while the chat continues", async () => {
+  const { createRun, getEvents, getRun } = await import("../src/lib/db");
+  const { addUserMessage, runChatRound } = await import("../src/lib/chat");
+  const { DEFAULT_SETTINGS } = await import("../src/lib/types");
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).endsWith("/models")) return Response.json({ data: [] });
+    const body = JSON.parse(String(init?.body));
+    if (body.model === "quota-test/model-a") {
+      return new Response('{"error":{"message":"429 insufficient_quota: daily allowance exhausted"}}', { status: 429 });
+    }
+    return Response.json({ model: body.model, choices: [{ message: { content: `Reply via ${body.model}.` } }] });
+  };
+  try {
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      models: {
+        ...DEFAULT_SETTINGS.models,
+        generators: ["quota-test/model-a", "quota-test/model-b", "quota-test/model-c", "quota-test/model-d"],
+      },
+    };
+    createRun("chat-quota", "A tiny camera game for a school event", "hackathon", settings, "chat");
+    addUserMessage("chat-quota", "A tiny camera game for a school event");
+    await runChatRound("chat-quota");
+    const run = getRun("chat-quota")!;
+    assert.equal(run.status, "completed", run.error);
+    const messages = getEvents("chat-quota").filter(e => e.kind === "message").map(e => JSON.parse(e.message));
+    assert.equal(messages.filter(m => m.role === "assistant").length, 6);
+    const warnings = getEvents("chat-quota").filter(e => e.kind === "warning").map(e => e.message);
+    assert.ok(warnings.some(w => /quota or rate limit/.test(w) && w.includes("quota-test/model-a") && w.includes("won't be retried")));
+  } finally { globalThis.fetch = realFetch; }
+});
+
 test("a total model outage fails honestly instead of hanging or masking the error", async () => {
   const { createRun, getEvents, getRun } = await import("../src/lib/db");
   const { addUserMessage, runChatRound } = await import("../src/lib/chat");

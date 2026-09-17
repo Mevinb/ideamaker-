@@ -48,6 +48,25 @@ test("Auto excludes known non-conversation model families", () => {
   assert.ok(Object.values(result.models).flat().every(model => model === "provider/chat"));
 });
 
+test("Auto never assigns billed OpenAI models but preserves manual paid picks", async () => {
+  const { isBilledOpenAIModel } = await import("../src/lib/model-assignments");
+  for (const free of ["openai/gpt-5", "openai/gpt-5.4", "openai/gpt-5.4-mini", "openai/gpt-5.4-nano", "openai/gpt-5.2", "openai/gpt-5.1", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/gpt-4.1", "openai/gpt-4.1-mini", "openai/gpt-4.1-nano", "openai/gpt-4o", "openai/gpt-4o-mini", "openai/o1", "openai/o3", "openai/o3-mini", "openai/o4-mini", "openai/gpt-5-2025-08-07", "openai/gpt-4o-2024-08-06", "openai/o1-2024-12-17", "openai/o3-2025-04-16", "openai/gpt-4.1-mini-2025-04-14", "openai/gpt-5.4-mini-2026-03-17"]) {
+    assert.equal(isBilledOpenAIModel(free), false, free);
+  }
+  for (const billed of ["openai/o1-pro", "openai/gpt-5-pro", "openai/gpt-5.5", "openai/gpt-3.5-turbo", "openai/gpt-5-chat-latest", "openai/gpt-5-codex", "openai/gpt-4o-transcribe", "openai/gpt-image-1", "openai/sora-2", "openai/gpt-4o-search-preview", "openai/davinci-002"]) {
+    assert.equal(isBilledOpenAIModel(billed), true, billed);
+  }
+  assert.equal(isBilledOpenAIModel("groq/llama-3"), false);
+
+  const available = ["openai/o1-pro", "openai/gpt-3.5-turbo", "openai/gpt-5.5", "openai/gpt-5", "openai/gpt-4o-mini", "openai/o3-2025-04-16", "groq/model-x"];
+  const result = resolveAutoModels(DEFAULT_SETTINGS, available);
+  for (const model of Object.values(result.models).flat()) assert.equal(isBilledOpenAIModel(model), false, model);
+
+  const manual = structuredClone(DEFAULT_SETTINGS);
+  manual.models.generators[0] = "openai/o1-pro";
+  assert.equal(resolveAutoModels(manual, available).models.generators[0], "openai/o1-pro");
+});
+
 test("sampleDistinctChatModels picks unique models across providers and respects exclusion sets", async () => {
   const { sampleDistinctChatModels } = await import("../src/lib/model-assignments");
   const catalog = [
@@ -70,5 +89,10 @@ test("sampleDistinctChatModels picks unique models across providers and respects
   assert.equal(nextPicked.length, 3);
   assert.ok(!nextPicked.includes(picked[0]));
   assert.ok(!nextPicked.includes(picked[1]));
+
+  // Billed OpenAI models are never auto-picked, even when present.
+  const freePicked = sampleDistinctChatModels(["openai/o1-pro", "openai/gpt-5", "openai/gpt-4o-mini", "groq/model-x"], 3);
+  assert.equal(freePicked.length, 3);
+  assert.ok(!freePicked.includes("openai/o1-pro"));
 });
 

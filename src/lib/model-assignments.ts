@@ -2,13 +2,30 @@ import type { RunSettings } from "./types";
 
 export const NON_CHAT_MODELS = /(?:whisper|orpheus|embed|rerank|moderation|guard|content-safety|lyria|tts|speech|flux|stable-diffusion|translate|parse|reward|clip|deplot|vision|audio|3\.5-flash|gemini-3-flash-agent|gpt-oss-120b|zamba|palmyra|deepseek-v4-pro-0813|glm-5\.2:free|mistralai\/mistral-large|deepseek-ai\/DeepSeek-V3|qwen\/qwen3\.[68]-27b|minimax.*:free|ling-3\.0-flash-fin-free|deepseek-v4-flash-0731|big-pickle|mimo-v2\.5-free)/i;
 
+// Free shared-traffic allowance: 250k tokens/day across the full-size families,
+// 2.5M tokens/day across mini/nano. Dated snapshots are the same model and the same
+// bucket. Anything else under openai/ may spend credits, so Auto and automatic
+// fallbacks never pick it. Explicit manual picks are still honored.
+const FREE_OPENAI_FULL = ["gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-4.1", "gpt-4o", "o1", "o3"];
+const FREE_OPENAI_SMALL = ["gpt-5.4-mini", "gpt-5.4-nano", "gpt-5-mini", "gpt-5-nano", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o-mini", "o3-mini", "o4-mini"];
+const FREE_OPENAI_PATTERN = new RegExp(
+  `^(?:${[...FREE_OPENAI_FULL, ...FREE_OPENAI_SMALL].map(id => id.replace(/\./g, "\\.")).join("|")})(-\\d{4}-\\d{2}-\\d{2})?$`
+);
+
+/** True for openai/ models outside the free shared-traffic allowance (may bill credits). */
+export function isBilledOpenAIModel(model: string): boolean {
+  const slash = model.indexOf("/");
+  if (slash < 0 || model.slice(0, slash) !== "openai") return false;
+  return !FREE_OPENAI_PATTERN.test(model.slice(slash + 1));
+}
+
 export function sampleDistinctChatModels(
   available: string[],
   count: number,
   exclude: Set<string> = new Set()
 ): string[] {
   const models = [...new Set(available)];
-  const autoModels = models.filter(model => !NON_CHAT_MODELS.test(model));
+  const autoModels = models.filter(model => !NON_CHAT_MODELS.test(model) && !isBilledOpenAIModel(model));
   if (!autoModels.length) return [];
 
   const unused = autoModels.filter(m => !exclude.has(m));
@@ -66,7 +83,7 @@ export function resolveAutoModels(settings: RunSettings, available: string[], ra
   if (!available.length) throw new Error("No available models. Refresh the gateway connection and retry.");
   const next = structuredClone(settings);
   const models = [...new Set(available)].sort();
-  let autoModels = models.filter(model => !NON_CHAT_MODELS.test(model));
+  let autoModels = models.filter(model => !NON_CHAT_MODELS.test(model) && !isBilledOpenAIModel(model));
   if (!autoModels.length && Object.values(settings.models).flat().includes("auto")) throw new Error("No text-generation models available for Auto.");
   if (randomize) {
     autoModels = [...autoModels].sort(() => Math.random() - 0.5);

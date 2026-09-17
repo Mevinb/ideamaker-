@@ -96,6 +96,11 @@ function recentIdeaExclusions(runId: string): string {
 
 const FAILED_MODELS = new Set<string>();
 
+// The gateway does not report remaining free-tier tokens, so an exhausted daily
+// allowance surfaces as a call error. Matching models are parked for the session
+// instead of being retried.
+const QUOTA_ERROR = /insufficient[_ ]?quota|quota[_ ]?(exceeded|exhausted)|exceed.*quota|out of credit|billing|payment required|\b402\b|\b429\b/i;
+
 export function recordFailedModel(model: string): void {
   FAILED_MODELS.add(model);
 }
@@ -229,6 +234,10 @@ async function reply(
       if (isStop(error, run.id)) throw error;
       FAILED_MODELS.add(model);
       lastError = error;
+      const detail = error instanceof Error ? error.message : "Unknown error";
+      if (QUOTA_ERROR.test(detail)) {
+        appendEvent(run.id, "warning", `${name}: ${model} hit a quota or rate limit and won't be retried this session (${detail.slice(0, 160)}).`, `Round ${round}`);
+      }
       active(run.id);
     }
   }
