@@ -4,9 +4,13 @@ import { availableModels, omniChat } from "./omniroute";
 import type { ChatMessage, Run, RunEvent } from "./types";
 
 const MAX_CONTEXT = 50_000;
-const MAX_REQUESTS = 12;
+// Total model-call budget per runChatRound invocation. Sized so each of the six
+// speakers can fail over to several alternates without starving later speakers.
+const MAX_REQUESTS = 24;
 const MAX_AUTONOMOUS_ROUNDS = 2;
 const RECENT_RUNS_FOR_NOVELTY = 20;
+// Alternates tried per speaker before that speaker sits out (the round continues).
+const MAX_SPEAKER_ATTEMPTS = 6;
 
 export const PARTICIPANT_ROLES = ["Explorer", "Challenger", "Builder", "Connector"];
 const PARTICIPANTS = [
@@ -42,6 +46,10 @@ function active(runId: string): void {
   const run = getRun(runId);
   if (!run || run.status === "cancelled") throw new Error("Group chat stopped");
   if (run.status === "failed") throw new Error("Group chat has stopped");
+}
+
+function isStop(error: unknown, runId: string): boolean {
+  return getRun(runId)?.status === "cancelled" || (error instanceof Error && error.message === "Group chat stopped");
 }
 
 function messageEvent(runId: string, message: ChatMessage): void {
@@ -167,8 +175,9 @@ async function reply(
   round: number,
   instruction: string,
   modelToUse: string,
-  maxAttempts: number
-): Promise<number> {
+  maxAttempts: number,
+  exclude: Set<string>
+): Promise<{ attempts: number; model: string }> {
   active(run.id);
   const requested = modelToUse || run.settings.models.generators[participant] || "auto";
   const name = PARTICIPANT_ROLES[participant];
@@ -176,34 +185,56 @@ async function reply(
   const system = `You are ${name} in a small group chat with ${others}, brainstorming together. ${PARTICIPANTS[participant]} Talk like a real person in a group thread: use plain prose with no bullet points, headings, or reports, reply to specific people by name, quote a concrete detail they said, and add one thought per message. Keep it short: 2-5 sentences, under 450 characters. Never summarize the whole chat or deliver a verdict. ${presetDirection(run.preset)} ${IDEA_QUALITY}`;
   const user = `User's brief: ${run.prompt}\n\nGroup chat so far:\n${transcript(run)}\n\nYour turn, ${name}: ${instruction}`;
 
-  let alternatives: string[] = [];
-  try {
-    const available = (await availableModels()).map(m => m.id).filter(m => !FAILED_MODELS.has(m));
-    alternatives = sampleDistinctChatModels(available, 4, new Set([requested, ...FAILED_MODELS]));
-  } catch {
-    appendEvent(run.id, "warning", "A fallback model could not be checked for this reply.", `Round ${round}`);
+  // Fallback must not depend on the live catalog alone: when the gateway is
+  // struggling, the /models check is the first thing to fail, which is exactly
+  // when alternates matter most. Recently working models are always eligible.
+  const known = new Set<string>();
+  for (const m of run.settings.models.generators) {
+    if (m && m !== "auto") known.add(m);
   }
+  for (const event of getEvents(run.id)) {
+    const msg = parseMessage(event);
+    if (msg?.model && msg.model !== "Not reported by gateway") known.add(msg.model);
+  }
+  let catalog: string[] = [];
+  try {
+    catalog = (await availableModels()).map(m => m.id);
+  } catch {
+    appendEvent(run.id, "warning", "The live model list was unreachable, so fallback uses recently working models.", `Round ${round}`);
+  }
+  const pool = [...new Set([requested, ...catalog, ...known])].filter(m => m && m !== "auto");
+  const rest = sampleDistinctChatModels(
+    pool.filter(m => m !== requested),
+    Math.max(0, Math.min(MAX_SPEAKER_ATTEMPTS, maxAttempts) - 1),
+    new Set([...exclude, ...FAILED_MODELS])
+  );
+  const candidates = [requested, ...rest].slice(0, Math.max(1, maxAttempts));
 
-  const candidates = [requested, ...alternatives].slice(0, Math.max(1, maxAttempts));
   let lastError: unknown;
   let attempts = 0;
   for (const model of candidates) {
     attempts++;
+    exclude.add(model);
     try {
       const answer = await omniChat({ model, system, user, maxTokens: 400, signal: AbortSignal.timeout(60_000) });
       active(run.id);
       const content = cleanCut(answer.content, 580);
       if (!content) throw new Error("The model returned an empty reply");
+      FAILED_MODELS.delete(model);
       messageEvent(run.id, { role: "assistant", agent: name, participant, model: answer.model, content, round });
       if (model !== requested) appendEvent(run.id, "warning", `${name} used fallback model ${answer.model} after ${requested} failed.`, `Round ${round}`);
-      return attempts;
+      return { attempts, model: answer.model };
     } catch (error) {
+      // Stopping must never burn more provider calls or ban a healthy model.
+      if (isStop(error, run.id)) throw error;
       FAILED_MODELS.add(model);
       lastError = error;
       active(run.id);
     }
   }
-  throw lastError instanceof Error ? lastError : new Error("No participant model completed a reply");
+  const exhausted = new Error(lastError instanceof Error ? lastError.message : "No participant model completed a reply");
+  (exhausted as { attempts?: number }).attempts = attempts;
+  throw exhausted;
 }
 
 export function addUserMessage(runId: string, content: string): { queued: boolean; run: Run } {
@@ -220,6 +251,12 @@ export function addUserMessage(runId: string, content: string): { queued: boolea
 export async function runChatRound(runId: string): Promise<void> {
   let run = getRun(runId);
   if (!run || run.mode !== "chat" || run.status === "cancelled") return;
+  // A failed round keeps its messages; "Keep talking" retries with other models.
+  if (run.status === "failed") {
+    updateRun(runId, { status: "queued", stage: "Retrying", error: "" });
+    appendEvent(runId, "status", "Retrying the group chat with other models.", "Retrying");
+    run = getRun(runId)!;
+  }
 
   const isContinuous = Boolean(run.settings.continuous);
   const maxRoundsToRun = isContinuous ? MAX_AUTONOMOUS_ROUNDS : 1;
@@ -254,16 +291,34 @@ export async function runChatRound(runId: string): Promise<void> {
       const allChatUsedModels = new Set(messages.filter(m => m.model).map(m => m.model!));
 
       let requests = 0;
+      let produced = 0;
+      const skipped: string[] = [];
+      let lastSpeakError: unknown;
       const speak = async (participant: number, instruction: string) => {
-        if (requests >= MAX_REQUESTS) throw new Error("The group round reached its request limit");
+        const label = PARTICIPANT_ROLES[participant];
         active(runId);
         const currentRun = getRun(runId)!;
         const modelToUse = await getRoundModel(currentRun, participant, currentRoundUsedModels, allChatUsedModels);
         currentRoundUsedModels.add(modelToUse);
-        allChatUsedModels.add(modelToUse);
-        const label = PARTICIPANT_ROLES[participant];
         updateRun(runId, { stage: `Round ${round} · ${label} is replying` });
-        requests += await reply(currentRun, participant, round, instruction, modelToUse, Math.min(3, MAX_REQUESTS - requests));
+        const budget = Math.min(MAX_SPEAKER_ATTEMPTS, MAX_REQUESTS - requests);
+        if (budget <= 0) throw new Error("The group round reached its request limit");
+        try {
+          const done = await reply(currentRun, participant, round, instruction, modelToUse, budget, currentRoundUsedModels);
+          requests += done.attempts;
+          currentRoundUsedModels.add(done.model);
+          allChatUsedModels.add(done.model);
+          produced++;
+        } catch (error) {
+          // One unavailable speaker sits out; the rest of the group carries on.
+          if (isStop(error, runId)) throw error;
+          requests += (error as { attempts?: number })?.attempts ?? 1;
+          lastSpeakError = error;
+          skipped.push(label);
+          appendEvent(runId, "warning", `${label} could not reply after trying other models: ${error instanceof Error ? error.message : "unknown error"}. The rest of the group carries on.`, `Round ${round}`);
+          messageEvent(runId, { role: "system", content: `${label} couldn't get a word in — every model tried was unavailable. The rest of the group carries on.`, round });
+          active(runId);
+        }
       };
 
       if (round === 1) {
@@ -296,11 +351,15 @@ export async function runChatRound(runId: string): Promise<void> {
         await speak(3, "Close the round like a person. Say what you would keep and what you need from the user next. No report or winner.");
       }
 
+      // Only fail honestly when nothing got through; partial rounds still count.
+      if (produced === 0) throw lastSpeakError instanceof Error ? lastSpeakError : new Error("No participant model completed a reply");
+      if (skipped.length) appendEvent(runId, "warning", `${skipped.join(", ")} sat out this round after repeated model failures.`, `Round ${round} complete`);
+
       roundsRan++;
       appendEvent(runId, "status", `Round ${round} finished. The group shared thoughts.`, `Round ${round} complete`);
 
       if (roundsRan >= maxRoundsToRun) {
-        updateRun(runId, { status: "completed", stage: `Round ${round} complete` });
+        updateRun(runId, { status: "completed", stage: `Round ${round} complete`, error: "" });
         break;
       }
 

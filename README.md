@@ -1,6 +1,6 @@
 # IdeaArena
 
-A local idea-generation workbench. New conversations are a four-participant group chat (Explorer, Challenger, Builder, Connector): each model sees the shared thread, replies to the others by name, and builds on the strongest direction. Older explorations, chats, and tournaments retain their original workflow.
+A local idea-generation workbench. New conversations are a four-participant group chat (Explorer, Challenger, Builder, Connector): each model sees the shared thread, replies to the others by name, and builds on the strongest direction. If a model is unavailable, the speaker automatically retries with another model; a speaker that cannot reach any model sits out instead of stopping the chat, and the run only fails if no reply gets through at all. Older explorations, chats, and tournaments retain their original workflow.
 
 ## Experimental exploration
 

@@ -122,3 +122,97 @@ test("continuous chat mode loops through rounds and halts on cancellation", asyn
     assert.ok(events.some(e => e.stage?.includes("Round 1 complete")));
   } finally { globalThis.fetch = realFetch; }
 });
+
+test("a speaker whose model 503s switches models instead of stopping the chat", async () => {
+  const { createRun, getEvents, getRun } = await import("../src/lib/db");
+  const { addUserMessage, runChatRound } = await import("../src/lib/chat");
+  const { DEFAULT_SETTINGS } = await import("../src/lib/types");
+  const realFetch = globalThis.fetch;
+  const prompts: string[] = [];
+  globalThis.fetch = async (url, init) => {
+    // The live catalog is unreachable exactly when failover matters most.
+    if (String(url).endsWith("/models")) return new Response("gateway overloaded", { status: 503 });
+    const body = JSON.parse(String(init?.body));
+    prompts.push(body.messages[1].content);
+    if (body.model === "failover-test/model-a") return new Response("worker limit reached", { status: 503 });
+    return Response.json({ model: body.model, choices: [{ message: { content: `Reply via ${body.model}.` } }] });
+  };
+  try {
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      models: {
+        ...DEFAULT_SETTINGS.models,
+        generators: ["failover-test/model-a", "failover-test/model-b", "failover-test/model-c", "failover-test/model-d"],
+      },
+    };
+    createRun("chat-failover", "A tiny camera game for a school event", "hackathon", settings, "chat");
+    addUserMessage("chat-failover", "A tiny camera game for a school event");
+    await runChatRound("chat-failover");
+    const run = getRun("chat-failover")!;
+    assert.equal(run.status, "completed", run.error);
+    const messages = getEvents("chat-failover").filter(e => e.kind === "message").map(e => JSON.parse(e.message));
+    assert.equal(messages.filter(m => m.role === "assistant").length, 6);
+    assert.ok(prompts.every(prompt => prompt.includes("Group chat so far")));
+    const warnings = getEvents("chat-failover").filter(e => e.kind === "warning").map(e => e.message);
+    assert.ok(warnings.some(w => w.includes("live model list was unreachable")));
+    assert.ok(warnings.some(w => w.includes("used fallback model") && w.includes("failover-test/model-a")));
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("a total model outage fails honestly instead of hanging or masking the error", async () => {
+  const { createRun, getEvents, getRun } = await import("../src/lib/db");
+  const { addUserMessage, runChatRound } = await import("../src/lib/chat");
+  const { DEFAULT_SETTINGS } = await import("../src/lib/types");
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith("/models")) return Response.json({ data: [] });
+    return new Response("worker limit reached", { status: 503 });
+  };
+  try {
+    createRun("chat-outage", "A tiny camera game for a school event", "hackathon", DEFAULT_SETTINGS, "chat");
+    addUserMessage("chat-outage", "A tiny camera game for a school event");
+    await runChatRound("chat-outage");
+    const run = getRun("chat-outage")!;
+    assert.equal(run.status, "failed");
+    assert.match(run.error || "", /OmniRoute 503/);
+    assert.doesNotMatch(run.error || "", /Group chat has stopped/);
+    const messages = getEvents("chat-outage").filter(e => e.kind === "message").map(e => JSON.parse(e.message));
+    assert.equal(messages.filter(m => m.role === "assistant").length, 0);
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("keep talking after a failure retries with other models instead of stopping again", async () => {
+  const { createRun, getEvents, getRun } = await import("../src/lib/db");
+  const { addUserMessage, runChatRound } = await import("../src/lib/chat");
+  const { DEFAULT_SETTINGS } = await import("../src/lib/types");
+  const realFetch = globalThis.fetch;
+  let outage = true;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).endsWith("/models")) return Response.json({ data: [] });
+    if (outage) return new Response("worker limit reached", { status: 503 });
+    const body = JSON.parse(String(init?.body));
+    return Response.json({ model: body.model, choices: [{ message: { content: `Recovered via ${body.model}.` } }] });
+  };
+  try {
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      models: {
+        ...DEFAULT_SETTINGS.models,
+        generators: ["retry-test/model-a", "retry-test/model-b", "retry-test/model-c", "retry-test/model-d"],
+      },
+    };
+    createRun("chat-retry", "A tiny camera game for a school event", "hackathon", settings, "chat");
+    addUserMessage("chat-retry", "A tiny camera game for a school event");
+    await runChatRound("chat-retry");
+    assert.equal(getRun("chat-retry")!.status, "failed");
+    outage = false;
+    addUserMessage("chat-retry", "Try again with whatever models are up.");
+    await runChatRound("chat-retry");
+    const run = getRun("chat-retry")!;
+    assert.equal(run.status, "completed", run.error);
+    assert.ok(!run.error);
+    const messages = getEvents("chat-retry").filter(e => e.kind === "message").map(e => JSON.parse(e.message));
+    // The failed round never completed, so the retry re-runs round 1.
+    assert.equal(messages.filter(m => m.role === "assistant").length, 6);
+  } finally { globalThis.fetch = realFetch; }
+});
