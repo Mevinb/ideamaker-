@@ -44,21 +44,31 @@ export function parseJsonOrSse(raw: string): { content: string; model?: string }
   return { content, model };
 }
 
+const TEMPERATURE_REJECTED = /unsupported parameter.*temperature|temperature.*not supported/i;
+
 export async function omniChat({ model, system, user, signal, json = false, maxTokens, temperature = 0.8 }: ChatOptions): Promise<{ content: string; model: string }> {
   const key = process.env.OMNIROUTE_API_KEY;
-  const response = await fetch(`${baseUrl()}/chat/completions`, {
+  const send = (omitTemperature: boolean) => fetch(`${baseUrl()}/chat/completions`, {
     method: "POST",
     signal,
     headers: { "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) },
     body: JSON.stringify({
       model,
-      temperature,
+      ...(omitTemperature ? {} : { temperature }),
       stream: false,
       ...(json ? { response_format: { type: "json_object" } } : {}),
       ...(maxTokens ? { max_tokens: maxTokens } : {}),
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
     }),
   });
+  let response = await send(false);
+  if (!response.ok && response.status === 400) {
+    // Newer reasoning models (e.g. openai/gpt-5.6-luna) reject the temperature
+    // parameter outright. Retry the same model without it before giving up.
+    const text = await response.text();
+    if (TEMPERATURE_REJECTED.test(text)) response = await send(true);
+    else throw new Error(`OmniRoute ${response.status}: ${text.slice(0, 300)}`);
+  }
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`OmniRoute ${response.status}: ${text.slice(0, 300)}`);
